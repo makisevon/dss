@@ -1,15 +1,15 @@
 #[allow(unused_imports)]
 #[macro_use]
 extern crate log;
-#[allow(unused_imports)]
 #[macro_use]
 extern crate prost_derive;
+
+use futures::executor::ThreadPool;
 
 pub mod kvraft;
 mod proto;
 pub mod raft;
 
-/// A place holder for suppressing unused_variables warning.
-fn your_code_here<T>(_: T) -> ! {
-    unimplemented!()
+lazy_static::lazy_static! {
+    static ref EXECUTOR: ThreadPool = ThreadPool::new().unwrap();
 }

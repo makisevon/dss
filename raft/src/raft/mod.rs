@@ -1,334 +1,883 @@
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::{
+    mem,
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
+};
 
-use futures::channel::mpsc::UnboundedSender;
+use futures::{
+    channel::mpsc::UnboundedSender, executor::ThreadPool, stream::FuturesUnordered, Future,
+    FutureExt, SinkExt, StreamExt,
+};
+use futures_timer::Delay;
+
+use labcodec::Message;
+use labrpc::Result as RpcResult;
+
+use crate::{kvraft::server::Size, proto::raftpb::*, EXECUTOR};
 
 #[cfg(test)]
 pub mod config;
+
 pub mod errors;
+use self::errors::{Error, Result};
+
 pub mod persister;
+use self::persister::Persister;
+
 #[cfg(test)]
 mod tests;
 
-use self::errors::*;
-use self::persister::*;
-use crate::proto::raftpb::*;
+#[derive(Clone)]
+pub struct Node {
+    raft: Arc<Mutex<Raft>>,
+}
 
-/// As each Raft peer becomes aware that successive log entries are committed,
-/// the peer should send an `ApplyMsg` to the service (or tester) on the same
-/// server, via the `apply_ch` passed to `Raft::new`.
+pub struct Raft {
+    current_term: u64,
+    voted_for: Option<usize>,
+
+    log: Log,
+
+    commit_index: u64,
+    last_applied: u64,
+
+    role: Role,
+    last_sign: Instant,
+
+    peers: Vec<RaftClient>,
+    me: usize,
+
+    persister: Box<dyn Persister>,
+    apply_ch: UnboundedSender<ApplyMsg>,
+
+    executor: ThreadPool,
+    weak: Weak<Mutex<Self>>,
+}
+
+#[derive(Message, Clone)]
+struct Log {
+    #[prost(message, repeated, tag = "1")]
+    entries: Vec<Entry>,
+
+    #[prost(uint64, tag = "2")]
+    offset: u64,
+}
+
+#[derive(PartialEq, Eq)]
+enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
+
         index: u64,
     },
-    // For 2D:
+
     Snapshot {
         data: Vec<u8>,
+
         term: u64,
         index: u64,
     },
 }
 
-/// State of a raft peer.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone)]
 pub struct State {
     pub term: u64,
+
     pub is_leader: bool,
 }
 
-impl State {
-    /// The current term of this peer.
-    pub fn term(&self) -> u64 {
-        self.term
+impl Node {
+    pub fn new(raft: Raft) -> Self {
+        let raft = Arc::new(Mutex::new(raft));
+        {
+            let mut inner = raft.lock().unwrap();
+            inner.weak = Arc::downgrade(&raft);
+            inner.spawn_follower_daemon();
+        }
+
+        Self { raft }
     }
-    /// Whether this peer believes it is the leader.
+
+    pub fn kill(&self) {
+        let mut raft = self.raft.lock().unwrap();
+        _ = raft.apply_ch.close();
+        raft.weak = Weak::new();
+    }
+
+    pub fn term(&self) -> u64 {
+        self.raft.lock().unwrap().current_term
+    }
+
     pub fn is_leader(&self) -> bool {
-        self.is_leader
+        self.raft.lock().unwrap().role == Role::Leader
+    }
+
+    pub fn get_state(&self) -> State {
+        let raft = self.raft.lock().unwrap();
+        State {
+            term: raft.current_term,
+
+            is_leader: raft.role == Role::Leader,
+        }
+    }
+
+    pub fn start(&self, command: &impl Message) -> Result<(u64, u64)> {
+        let mut raft = self.raft.lock().unwrap();
+        if raft.role != Role::Leader {
+            return Err(Error::NotLeader);
+        }
+
+        let mut data = Vec::new();
+        labcodec::encode(command, &mut data).map_err(Error::Encode)?;
+
+        let term = raft.current_term;
+        raft.log.push(Entry::new(data, term));
+
+        raft.persister.save_raft_state(raft.state());
+        Ok((raft.log.len() - 1, term))
+    }
+
+    pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
+        let mut raft = self.raft.lock().unwrap();
+        if index <= raft.log.offset {
+            return;
+        }
+
+        raft.log.offset(index);
+        raft.persister
+            .save_state_and_snapshot(raft.state(), snapshot.into());
+    }
+
+    pub fn cond_install_snapshot(
+        &self,
+        _last_included_term: u64,
+        _last_included_index: u64,
+        _snapshot: &[u8],
+    ) -> bool {
+        true
     }
 }
 
-// A single Raft peer.
-pub struct Raft {
-    // RPC end points of all peers
-    peers: Vec<RaftClient>,
-    // Object to hold this peer's persisted state
-    persister: Box<dyn Persister>,
-    // this peer's index into peers[]
-    me: usize,
-    state: Arc<State>,
-    // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
+macro_rules! try_follow {
+    ($term:expr, $raft:ident, $reply:expr) => {{
+        let term = $term;
+
+        let reply = $reply;
+        assert!(reply.term == $raft.current_term);
+
+        if term < $raft.current_term {
+            return Ok(reply);
+        }
+
+        if term > $raft.current_term {
+            $raft.transfer(term, Role::Follower);
+        }
+    }};
+}
+
+macro_rules! must_follow {
+    ($term:expr, $raft:ident, $reply:expr) => {{
+        let term = $term;
+        try_follow!(term, $raft, $reply);
+
+        assert!($raft.role != Role::Leader);
+        if $raft.role != Role::Follower {
+            $raft.transfer(term, Role::Follower);
+        } else {
+            $raft.last_sign = Instant::now();
+        }
+    }};
+}
+
+#[async_trait::async_trait]
+impl RaftService for Node {
+    async fn request_vote(&self, args: RequestVoteArgs) -> RpcResult<RequestVoteReply> {
+        let mut raft = self.raft.lock().unwrap();
+        try_follow!(
+            args.term,
+            raft,
+            RequestVoteReply::new(raft.current_term, false)
+        );
+
+        let candidate_id = args.candidate_id as usize;
+        assert!(candidate_id < raft.peers.len());
+
+        let last_term_and_index = (raft.log.last().term, raft.log.len() - 1);
+        if matches!(raft.voted_for, Some(id) if id != candidate_id)
+            || (args.last_log_term, args.last_log_index) < last_term_and_index
+        {
+            return Ok(RequestVoteReply::new(raft.current_term, false));
+        }
+
+        raft.voted_for = Some(candidate_id);
+        raft.last_sign = Instant::now();
+
+        raft.persister.save_raft_state(raft.state());
+        Ok(RequestVoteReply::new(raft.current_term, true))
+    }
+
+    async fn append_entries(&self, mut args: AppendEntriesArgs) -> RpcResult<AppendEntriesReply> {
+        let mut raft = self.raft.lock().unwrap();
+        must_follow!(
+            args.term,
+            raft,
+            AppendEntriesReply::new(raft.current_term, false, 0, 0)
+        );
+
+        let len = raft.log.len();
+        if args.prev_log_index >= len {
+            return Ok(AppendEntriesReply::new(raft.current_term, false, 0, len));
+        }
+
+        let prev_entry = raft.log.get(args.prev_log_index);
+        if matches!(prev_entry, Some(entry) if entry.term != args.prev_log_term) {
+            let term = prev_entry.unwrap().term;
+            let last_without = (raft.log.offset..args.prev_log_index)
+                .rev()
+                .find(|&i| raft.log.get(i).unwrap().term != term)
+                .unwrap_or(raft.log.offset);
+
+            return Ok(AppendEntriesReply::new(
+                raft.current_term,
+                false,
+                term,
+                last_without + 1,
+            ));
+        }
+
+        if prev_entry.is_none() {
+            args.entries = args
+                .entries
+                .into_iter()
+                .skip((raft.log.offset - args.prev_log_index) as usize)
+                .collect();
+
+            args.prev_log_term = raft.log.first().term;
+            args.prev_log_index = raft.log.offset;
+        }
+
+        let log_offset = args.prev_log_index + 1;
+        if let Some((i, _)) = args.entries.iter().enumerate().find(|&(i, entry)| {
+            !matches!(raft.log.get(i as u64 + log_offset), Some(last) if last.term == entry.term)
+        }) {
+            raft.log.truncate(i as u64 + log_offset);
+            raft.log.append(&mut args.entries.into_iter().skip(i).collect());
+        }
+
+        let last_index = raft.log.len() - 1;
+        raft.commit_and_apply(args.leader_commit.min(last_index));
+
+        raft.persister.save_raft_state(raft.state());
+        Ok(AppendEntriesReply::new(raft.current_term, true, 0, 0))
+    }
+
+    async fn install_snapshot(&self, args: InstallSnapshotArgs) -> RpcResult<InstallSnapshotReply> {
+        let mut raft = self.raft.lock().unwrap();
+        must_follow!(
+            args.term,
+            raft,
+            InstallSnapshotReply::new(raft.current_term)
+        );
+
+        if args.last_included_index <= raft.commit_index {
+            return Ok(InstallSnapshotReply::new(raft.current_term));
+        }
+
+        assert!(args.last_included_term >= raft.log.get(raft.commit_index).unwrap().term);
+        if matches!(
+            raft.log.get(args.last_included_index),
+            Some(entry) if entry.term == args.last_included_term
+        ) {
+            raft.log.offset(args.last_included_index);
+        } else {
+            raft.log
+                .reset(args.last_included_term, args.last_included_index);
+        }
+
+        raft.snapshot(
+            args.data.clone(),
+            args.last_included_term,
+            args.last_included_index,
+        );
+
+        raft.persister
+            .save_state_and_snapshot(raft.state(), args.data);
+
+        Ok(InstallSnapshotReply::new(raft.current_term))
+    }
+}
+
+impl RequestVoteReply {
+    fn new(term: u64, vote_granted: bool) -> Self {
+        Self { term, vote_granted }
+    }
+}
+
+impl AppendEntriesReply {
+    fn new(term: u64, success: bool, conflicting_term: u64, first_conflicted: u64) -> Self {
+        Self {
+            term,
+
+            success,
+
+            conflicting_term,
+            first_conflicted,
+        }
+    }
+}
+
+impl InstallSnapshotReply {
+    fn new(term: u64) -> Self {
+        Self { term }
+    }
+}
+
+impl Size for Node {
+    fn size(&self) -> usize {
+        self.raft.lock().unwrap().state().len()
+    }
+}
+
+#[derive(Message)]
+struct Persistence {
+    #[prost(uint64, tag = "1")]
+    current_term: u64,
+    #[prost(message, tag = "2")]
+    voted_for: Option<u64>,
+
+    #[prost(message, tag = "3")]
+    log: Option<Log>,
 }
 
 impl Raft {
-    /// the service or tester wants to create a Raft server. the ports
-    /// of all the Raft servers (including this one) are in peers. this
-    /// server's port is peers[me]. all the servers' peers arrays
-    /// have the same order. persister is a place for this server to
-    /// save its persistent state, and also initially holds the most
-    /// recent saved state, if any. apply_ch is a channel on which the
-    /// tester or service expects Raft to send ApplyMsg messages.
-    /// This method must return quickly.
     pub fn new(
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
         apply_ch: UnboundedSender<ApplyMsg>,
-    ) -> Raft {
-        let raft_state = persister.raft_state();
+    ) -> Self {
+        let mut raft = Self {
+            current_term: 0,
+            voted_for: None,
 
-        // Your initialization code here (2A, 2B, 2C).
-        let mut rf = Raft {
+            log: Log::new(),
+
+            commit_index: 0,
+            last_applied: 0,
+
+            role: Role::Follower,
+            last_sign: Instant::now(),
+
             peers,
-            persister,
             me,
-            state: Arc::default(),
+
+            persister,
+            apply_ch,
+
+            executor: ThreadPool::clone(&EXECUTOR),
+            weak: Weak::new(),
         };
 
-        // initialize from state persisted before a crash
-        rf.restore(&raft_state);
-
-        crate::your_code_here((rf, apply_ch))
-    }
-
-    /// save Raft's persistent state to stable storage,
-    /// where it can later be retrieved after a crash and restart.
-    /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
-    }
-
-    /// restore previously persisted state.
-    fn restore(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            // bootstrap without any state?
+        let state = raft.persister.raft_state();
+        if state.is_empty() {
+            return raft;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
-    }
 
-    /// example code to send a RequestVote RPC to a server.
-    /// server is the index of the target server in peers.
-    /// expects RPC arguments in args.
-    ///
-    /// The labrpc package simulates a lossy network, in which servers
-    /// may be unreachable, and in which requests and replies may be lost.
-    /// This method sends a request and waits for a reply. If a reply arrives
-    /// within a timeout interval, This method returns Ok(_); otherwise
-    /// this method returns Err(_). Thus this method may not return for a while.
-    /// An Err(_) return can be caused by a dead server, a live server that
-    /// can't be reached, a lost request, or a lost reply.
-    ///
-    /// This method is guaranteed to return (perhaps after a delay) *except* if
-    /// the handler function on the server side does not return.  Thus there
-    /// is no need to implement your own timeouts around this method.
-    ///
-    /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(
-        &self,
-        server: usize,
-        args: RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let peer_clone = peer.clone();
-        // let (tx, rx) = channel();
-        // peer.spawn(async move {
-        //     let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-        //     tx.send(res);
-        // });
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
-    }
+        let persistence: Persistence = labcodec::decode(&state).unwrap();
+        raft.current_term = persistence.current_term;
+        raft.voted_for = persistence.voted_for.map(|id| id as usize);
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        raft.log = persistence.log.unwrap();
+        if raft.log.offset == 0 {
+            return raft;
         }
-    }
 
-    fn cond_install_snapshot(
-        &mut self,
-        last_included_term: u64,
-        last_included_index: u64,
-        snapshot: &[u8],
-    ) -> bool {
-        // Your code here (2D).
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
-    }
+        raft.snapshot(
+            raft.persister.snapshot(),
+            raft.log.first().term,
+            raft.log.offset,
+        );
 
-    fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
-        // Your code here (2D).
-        crate::your_code_here((index, snapshot));
+        raft
     }
+}
+
+macro_rules! must_upgrade {
+    ($weak:ident) => {
+        match $weak.upgrade() {
+            Some(raft) => raft,
+            None => return,
+        }
+    };
+}
+
+macro_rules! must_lock {
+    ($raft:ident, $current_term:ident, $role:expr) => {{
+        let raft = $raft.lock().unwrap();
+        assert!(raft.current_term >= $current_term);
+
+        let role = $role;
+
+        if raft.current_term > $current_term || role == Role::Candidate && raft.role != role {
+            return;
+        }
+
+        assert!(raft.role == role);
+        raft
+    }};
+}
+
+macro_rules! try_call {
+    ($rpc:ident, $timer:ident) => {
+        futures::select! {
+            reply = $rpc => Some(reply),
+            _ = $timer => None,
+        }
+    };
+}
+
+macro_rules! must_unwrap {
+    ($reply:ident, $current_term:ident, $raft:ident, $role:expr) => {{
+        let reply = match $reply.unwrap() {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+
+        assert!(reply.term >= $current_term);
+        if reply.term > $current_term {
+            must_lock!($raft, $current_term, $role).transfer(reply.term, Role::Follower);
+            return;
+        }
+
+        reply
+    }};
 }
 
 impl Raft {
-    /// Only for suppressing deadcode warnings.
-    #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
-        let _ = self.cond_install_snapshot(0, 0, &[]);
-        self.snapshot(0, &[]);
-        let _ = self.send_request_vote(0, Default::default());
-        self.persist();
-        let _ = &self.state;
-        let _ = &self.me;
-        let _ = &self.persister;
-        let _ = &self.peers;
+    fn spawn_follower_daemon(&mut self) {
+        self.last_sign = Instant::now();
+
+        let weak = Weak::clone(&self.weak);
+        let current_term = self.current_term;
+
+        self.executor.spawn_ok(async move {
+            let election_timeout = Self::generate_election_timeout();
+            #[allow(clippy::while_let_loop)]
+            loop {
+                let raft = must_upgrade!(weak);
+                let elapsed = {
+                    let mut raft = must_lock!(raft, current_term, Role::Follower);
+                    let elapsed = raft.last_sign.elapsed();
+
+                    if elapsed > election_timeout {
+                        raft.transfer(current_term + 1, Role::Candidate);
+                        return;
+                    }
+
+                    elapsed
+                };
+
+                Delay::new(election_timeout - elapsed).await;
+            }
+        });
+    }
+
+    fn spawn_candidate_daemon(&mut self) {
+        self.voted_for = Some(self.me);
+
+        let total = self.peers.len();
+        if total == 1 {
+            self.transfer(self.current_term, Role::Leader);
+            return;
+        }
+
+        struct Guard {
+            inner: FuturesUnordered<Rpc>,
+
+            executor: ThreadPool,
+        }
+
+        type Rpc = Pin<Box<dyn Future<Output = RpcResult<RequestVoteReply>> + Send>>;
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let rpcs = mem::replace(&mut self.inner, FuturesUnordered::new());
+                self.executor
+                    .spawn_ok(async { _ = rpcs.collect::<Vec<_>>().await });
+            }
+        }
+
+        let args = RequestVoteArgs {
+            term: self.current_term,
+
+            candidate_id: self.me as u64,
+
+            last_log_term: self.log.last().term,
+            last_log_index: self.log.len() - 1,
+        };
+
+        let rpcs: FuturesUnordered<_> = self
+            .others()
+            .map(|(_, peer)| peer.request_vote(&args))
+            .collect();
+
+        let mut rpcs = Guard {
+            inner: rpcs,
+
+            executor: ThreadPool::clone(&self.executor),
+        };
+
+        let weak = Weak::clone(&self.weak);
+        let current_term = self.current_term;
+
+        self.executor.spawn_ok(async move {
+            let mut election_timer = Delay::new(Self::generate_election_timeout()).fuse();
+
+            let mut votes = 1;
+            let majority = total / 2 + 1;
+
+            #[allow(clippy::while_let_loop)]
+            loop {
+                let raft = must_upgrade!(weak);
+
+                let mut rpc = rpcs.inner.select_next_some();
+                let reply = try_call!(rpc, election_timer);
+
+                if reply.is_none() {
+                    must_lock!(raft, current_term, Role::Candidate)
+                        .transfer(current_term + 1, Role::Candidate);
+
+                    return;
+                }
+
+                let reply = must_unwrap!(reply, current_term, raft, Role::Candidate);
+                if !reply.vote_granted {
+                    continue;
+                }
+
+                votes += 1;
+                if votes < majority {
+                    continue;
+                }
+
+                must_lock!(raft, current_term, Role::Candidate)
+                    .transfer(current_term, Role::Leader);
+
+                return;
+            }
+        });
+    }
+
+    const HEARTBEAT_PERIOD: Duration = Duration::from_millis(80);
+
+    fn spawn_leader_daemon(&self) {
+        let total = self.peers.len();
+        if total == 1 {
+            return;
+        }
+
+        struct State {
+            next_index: Vec<u64>,
+
+            match_index: Vec<u64>,
+        }
+
+        let state = Arc::new(Mutex::new(State {
+            next_index: vec![self.log.len(); total],
+
+            match_index: vec![0; total],
+        }));
+
+        let major_index = (total + 1) / 2;
+
+        self.others().for_each(|(id, other)| {
+            let weak = Weak::clone(&self.weak);
+            let current_term = self.current_term;
+            let state = Arc::clone(&state);
+
+            let peer = other.clone();
+
+            other.spawn(async move {
+                #[allow(clippy::while_let_loop)]
+                loop {
+                    let raft = must_upgrade!(weak);
+
+                    enum Rpc {
+                        AppendEntries(AppendEntriesArgs),
+                        InstallSnapshot(InstallSnapshotArgs),
+                    }
+
+                    let (last_matched, rpc) = {
+                        let raft = must_lock!(raft, current_term, Role::Leader);
+
+                        let next_index = state.lock().unwrap().next_index[id];
+                        if next_index <= raft.log.offset {
+                            let args = InstallSnapshotArgs {
+                                term: current_term,
+
+                                last_included_term: raft.log.first().term,
+                                last_included_index: raft.log.offset,
+
+                                data: raft.persister.snapshot(),
+                            };
+
+                            (raft.log.offset, Rpc::InstallSnapshot(args))
+                        } else {
+                            let prev_log_index = next_index - 1;
+                            let args = AppendEntriesArgs {
+                                term: current_term,
+
+                                prev_log_term: raft.log.get(prev_log_index).unwrap().term,
+                                prev_log_index,
+
+                                entries: raft.log.tail(next_index).cloned().collect(),
+                                leader_commit: raft.commit_index,
+                            };
+
+                            (raft.log.len() - 1, Rpc::AppendEntries(args))
+                        }
+                    };
+
+                    macro_rules! must_call {
+                        ($rpc:expr, $peer:ident, $current_term:ident, $raft:ident) => {{
+                            let mut rpc = $rpc.fuse();
+                            let mut heartbeat_timer = Delay::new(Self::HEARTBEAT_PERIOD).fuse();
+
+                            let reply = try_call!(rpc, heartbeat_timer);
+                            if reply.is_none() {
+                                $peer.spawn(async { _ = rpc.await });
+                                continue;
+                            }
+
+                            must_unwrap!(reply, $current_term, $raft, Role::Leader)
+                        }};
+                    }
+
+                    if let Rpc::InstallSnapshot(args) = rpc {
+                        _ = must_call!(peer.install_snapshot(&args), peer, current_term, raft);
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.next_index[id] = last_matched + 1;
+                        }
+
+                        Delay::new(Self::HEARTBEAT_PERIOD).await;
+                        continue;
+                    }
+
+                    let args = match rpc {
+                        Rpc::AppendEntries(args) => args,
+                        Rpc::InstallSnapshot(_) => unreachable!(),
+                    };
+
+                    let reply = must_call!(peer.append_entries(&args), peer, current_term, raft);
+                    {
+                        let mut raft = must_lock!(raft, current_term, Role::Leader);
+                        let mut state = state.lock().unwrap();
+
+                        if !reply.success {
+                            state.next_index[id] = raft
+                                .log
+                                .back(reply.conflicting_term)
+                                .unwrap_or_else(|| reply.first_conflicted.max(1))
+                                .min((state.next_index[id] - 1).max(1));
+                        } else if last_matched > state.match_index[id] {
+                            state.next_index[id] = last_matched + 1;
+                            state.match_index[id] = last_matched;
+
+                            let mut match_index = state.match_index.clone();
+                            match_index.sort_unstable();
+
+                            let major_matched = match_index[major_index];
+                            if matches!(
+                                raft.log.get(major_matched),
+                                Some(entry) if entry.term == current_term
+                            ) {
+                                raft.commit_and_apply(major_matched);
+                            }
+                        } else {
+                            state.next_index[id] = last_matched + 1;
+                        }
+                    }
+
+                    Delay::new(Self::HEARTBEAT_PERIOD).await;
+                }
+            });
+        });
+    }
+
+    fn transfer(&mut self, term: u64, role: Role) {
+        assert!(term >= self.current_term);
+        if term > self.current_term {
+            self.current_term = term;
+            self.voted_for = None;
+        }
+
+        self.role = role;
+        match self.role {
+            Role::Follower => self.spawn_follower_daemon(),
+            Role::Candidate => self.spawn_candidate_daemon(),
+            Role::Leader => self.spawn_leader_daemon(),
+        }
+
+        self.persister.save_raft_state(self.state());
+    }
+
+    fn generate_election_timeout() -> Duration {
+        Duration::from_millis(240 + rand::random::<u64>() % 240)
+    }
+
+    fn others(&self) -> impl Iterator<Item = (usize, &RaftClient)> {
+        self.peers
+            .iter()
+            .enumerate()
+            .filter(move |&(id, _)| id != self.me)
+    }
+
+    fn commit_and_apply(&mut self, to: u64) {
+        assert!(to < self.log.len());
+        if to > self.commit_index {
+            self.commit_index = to;
+        }
+
+        if to <= self.last_applied {
+            return;
+        }
+
+        (self.last_applied + 1..=to).for_each(|i| {
+            _ = self.apply_ch.unbounded_send(ApplyMsg::Command {
+                data: self.log.get(i).unwrap().data.clone(),
+
+                index: i,
+            });
+        });
+
+        self.last_applied = to;
+    }
+
+    fn snapshot(&mut self, data: Vec<u8>, term: u64, index: u64) {
+        assert!(index > self.commit_index);
+        _ = self
+            .apply_ch
+            .unbounded_send(ApplyMsg::Snapshot { data, term, index });
+
+        self.commit_index = index;
+        self.last_applied = index;
+    }
+
+    fn state(&self) -> Vec<u8> {
+        let persistence = Persistence {
+            current_term: self.current_term,
+            voted_for: self.voted_for.map(|id| id as u64),
+
+            log: Some(self.log.clone()),
+        };
+
+        let mut state = Vec::new();
+        labcodec::encode(&persistence, &mut state).unwrap();
+
+        state
     }
 }
 
-// Choose concurrency paradigm.
-//
-// You can either drive the raft state machine by the rpc framework,
-//
-// ```rust
-// struct Node { raft: Arc<Mutex<Raft>> }
-// ```
-//
-// or spawn a new thread runs the raft state machine and communicate via
-// a channel.
-//
-// ```rust
-// struct Node { sender: Sender<Msg> }
-// ```
-#[derive(Clone)]
-pub struct Node {
-    // Your code here.
-}
+impl Log {
+    fn new() -> Self {
+        Self {
+            entries: vec![Entry::default()],
 
-impl Node {
-    /// Create a new raft service.
-    pub fn new(raft: Raft) -> Node {
-        // Your code here.
-        crate::your_code_here(raft)
-    }
-
-    /// the service using Raft (e.g. a k/v server) wants to start
-    /// agreement on the next command to be appended to Raft's log. if this
-    /// server isn't the leader, returns [`Error::NotLeader`]. otherwise start
-    /// the agreement and return immediately. there is no guarantee that this
-    /// command will ever be committed to the Raft log, since the leader
-    /// may fail or lose an election. even if the Raft instance has been killed,
-    /// this function should return gracefully.
-    ///
-    /// the first value of the tuple is the index that the command will appear
-    /// at if it's ever committed. the second is the current term.
-    ///
-    /// This method must return without blocking on the raft.
-    pub fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
-    }
-
-    /// The current term of this peer.
-    pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
-    }
-
-    /// Whether this peer believes it is the leader.
-    pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
-    }
-
-    /// The current state of this peer.
-    pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            offset: 0,
         }
     }
 
-    /// the tester calls kill() when a Raft instance won't be
-    /// needed again. you are not required to do anything in
-    /// kill(), but it might be convenient to (for example)
-    /// turn off debug output from this instance.
-    /// In Raft paper, a server crash is a PHYSICAL crash,
-    /// A.K.A all resources are reset. But we are simulating
-    /// a VIRTUAL crash in tester, so take care of background
-    /// threads you generated with this Raft Node.
-    pub fn kill(&self) {
-        // Your code here, if desired.
+    fn len(&self) -> u64 {
+        self.entries.len() as u64 + self.offset
     }
 
-    /// A service wants to switch to snapshot.  
-    ///
-    /// Only do so if Raft hasn't have more recent info since it communicate
-    /// the snapshot on `apply_ch`.
-    pub fn cond_install_snapshot(
-        &self,
-        last_included_term: u64,
-        last_included_index: u64,
-        snapshot: &[u8],
-    ) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+    fn first(&self) -> &Entry {
+        &self.entries[0]
     }
 
-    /// The service says it has created a snapshot that has all info up to and
-    /// including index. This means the service no longer needs the log through
-    /// (and including) that index. Raft should now trim its log as much as
-    /// possible.
-    pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
-        // Your code here.
-        // Example:
-        // self.raft.snapshot(index, snapshot)
-        crate::your_code_here((index, snapshot));
+    fn last(&self) -> &Entry {
+        self.entries.last().unwrap()
+    }
+
+    fn get(&self, index: u64) -> Option<&Entry> {
+        self.entries.get(index.checked_sub(self.offset)? as usize)
+    }
+
+    fn push(&mut self, entry: Entry) {
+        assert!(entry.term >= self.last().term);
+        self.entries.push(entry);
+    }
+
+    fn append(&mut self, other: &mut Vec<Entry>) {
+        if other.is_empty() {
+            return;
+        }
+
+        assert!(other[0].term >= self.last().term);
+        self.entries.append(other)
+    }
+
+    fn truncate(&mut self, len: u64) {
+        assert!(len > self.offset);
+        self.entries.truncate((len - self.offset) as usize);
+    }
+
+    fn tail(&self, from: u64) -> impl Iterator<Item = &Entry> {
+        assert!(from > self.offset);
+        self.entries.iter().skip((from - self.offset) as usize)
+    }
+
+    fn back(&self, with: u64) -> Option<u64> {
+        let next = self
+            .entries
+            .binary_search_by_key(&(with + 1), |entry| entry.term)
+            .unwrap_or_else(|index| index);
+
+        if next <= 1 {
+            return None;
+        }
+
+        let index = next - 1;
+        (self.entries[index].term == with).then(|| index as u64 + self.offset)
+    }
+
+    fn offset(&mut self, to: u64) {
+        assert!((self.offset + 1..self.len()).contains(&to));
+        self.entries.drain(0..(to - self.offset) as usize);
+
+        self.entries[0].data.clear();
+        self.offset = to;
+    }
+
+    fn reset(&mut self, term: u64, index: u64) {
+        assert!(term >= self.first().term);
+        self.entries = vec![Entry::new(Vec::new(), term)];
+
+        assert!(index > self.offset);
+        self.offset = index;
     }
 }
 
-#[async_trait::async_trait]
-impl RaftService for Node {
-    // example RequestVote RPC handler.
-    //
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        // Your code here (2A, 2B).
-        crate::your_code_here(args)
+impl Entry {
+    fn new(data: Vec<u8>, term: u64) -> Self {
+        Self { data, term }
+    }
+}
+
+impl State {
+    pub fn term(&self) -> u64 {
+        self.term
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.is_leader
     }
 }
