@@ -1,22 +1,23 @@
-use crate::msg::{
-    CommitRequest, CommitResponse, GetRequest, GetResponse, PrewriteRequest, PrewriteResponse,
-    TimestampRequest, TimestampResponse,
-};
+use crate::msg::*;
 
 labrpc::service! {
     service timestamp {
-        rpc get_timestamp(TimestampRequest) returns (TimestampResponse);
+        rpc get_timestamp(TimestampArgs) returns (TimestampReply);
     }
 }
 
-pub use timestamp::{add_service as add_tso_service, Client as TSOClient, Service};
+pub use self::timestamp::{
+    add_service as add_tso_service, Client as TsoClient, Service as TsoService,
+};
 
 labrpc::service! {
     service transaction {
-        rpc get(GetRequest) returns (GetResponse);
-        rpc prewrite(PrewriteRequest) returns (PrewriteResponse);
-        rpc commit(CommitRequest) returns (CommitResponse);
+        rpc get(GetArgs) returns (GetReply);
+        rpc prewrite(PrewriteArgs) returns (PrewriteReply);
+        rpc commit(CommitArgs) returns (CommitReply);
     }
 }
 
-pub use transaction::{add_service as add_transaction_service, Client as TransactionClient};
+pub use self::transaction::{
+    add_service as add_transaction_service, Client as TxnClient, Service as TxnService,
+};

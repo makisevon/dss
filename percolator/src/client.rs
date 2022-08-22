@@ -1,60 +1,160 @@
-use labrpc::*;
+use std::{collections::HashMap, time::Duration};
 
-use crate::service::{TSOClient, TransactionClient};
+use futures::{executor, stream::FuturesUnordered, StreamExt};
+use futures_timer::Delay;
 
-// BACKOFF_TIME_MS is the wait time before retrying to send the request.
-// It should be exponential growth. e.g.
-//|  retry time  |  backoff time  |
-//|--------------|----------------|
-//|      1       |       100      |
-//|      2       |       200      |
-//|      3       |       400      |
-const BACKOFF_TIME_MS: u64 = 100;
-// RETRY_TIMES is the maximum number of times a client attempts to send a request.
-const RETRY_TIMES: usize = 3;
+use labrpc::{Error as RpcError, Result as RpcResult, RpcFuture};
 
-/// Client mainly has two purposes:
-/// One is getting a monotonically increasing timestamp from TSO (Timestamp Oracle).
-/// The other is do the transaction logic.
+use crate::{
+    msg::{CommitArgs, GetArgs, PrewriteArgs, TimestampArgs},
+    service::{TsoClient, TxnClient},
+};
+
 #[derive(Clone)]
 pub struct Client {
-    // Your definitions here.
+    tso_client: TsoClient,
+    txn_client: TxnClient,
+
+    transaction: Option<Transaction>,
+}
+
+#[derive(Clone)]
+struct Transaction {
+    timestamp: u64,
+
+    write: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+#[allow(dead_code)]
+impl Client {
+    pub fn new(tso_client: TsoClient, txn_client: TxnClient) -> Self {
+        Self {
+            tso_client,
+            txn_client,
+
+            transaction: None,
+        }
+    }
+
+    pub fn get_timestamp(&self) -> RpcResult<u64> {
+        executor::block_on(self.timestamp())
+    }
+
+    pub fn begin(&mut self) {
+        assert!(self.transaction.is_none());
+        self.transaction = Some(Transaction {
+            timestamp: self.get_timestamp().unwrap(),
+
+            write: HashMap::new(),
+        });
+    }
+
+    pub fn get(&self, key: Vec<u8>) -> RpcResult<Vec<u8>> {
+        let args = GetArgs {
+            start_ts: self.transaction.as_ref().unwrap().timestamp,
+
+            key,
+        };
+
+        Ok(executor::block_on(Self::call(|| self.txn_client.get(&args)))?.value)
+    }
+
+    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        _ = self.transaction.as_mut().unwrap().write.insert(key, value);
+    }
+
+    pub fn commit(&mut self) -> RpcResult<bool> {
+        let transaction = self.transaction.take().unwrap();
+        if transaction.write.is_empty() {
+            return Ok(true);
+        }
+
+        executor::block_on(async {
+            let start_ts = transaction.timestamp;
+            let primary_key = transaction.write.keys().next().unwrap().clone();
+
+            #[allow(clippy::needless_collect)]
+            let secondary_keys: Vec<_> = transaction.write.keys().skip(1).cloned().collect();
+
+            for (key, value) in transaction.write.into_iter() {
+                let args = PrewriteArgs {
+                    start_ts,
+
+                    key,
+                    value,
+
+                    primary_key: primary_key.clone(),
+                };
+
+                if !Self::call(|| self.txn_client.prewrite(&args))
+                    .await?
+                    .success
+                {
+                    return Ok(false);
+                }
+            }
+
+            let commit_ts = self.timestamp().await?;
+            let args = CommitArgs::new(start_ts, commit_ts, primary_key, true);
+
+            let result = Self::call(|| self.txn_client.commit(&args)).await;
+            if matches!(&result, Err(RpcError::Other(error)) if error == "reqhook")
+                || !result?.success
+            {
+                return Ok(false);
+            }
+
+            let commit = |key| async {
+                let args = CommitArgs::new(start_ts, commit_ts, key, false);
+                _ = Self::call(|| self.txn_client.commit(&args)).await;
+            };
+
+            secondary_keys
+                .into_iter()
+                .map(commit)
+                .collect::<FuturesUnordered<_>>()
+                .collect::<Vec<_>>()
+                .await;
+
+            Ok(true)
+        })
+    }
 }
 
 impl Client {
-    /// Creates a new Client.
-    pub fn new(tso_client: TSOClient, txn_client: TransactionClient) -> Client {
-        // Your code here.
-        Client {}
+    async fn timestamp(&self) -> RpcResult<u64> {
+        let args = TimestampArgs {};
+        Ok(Self::call(|| self.tso_client.get_timestamp(&args))
+            .await?
+            .timestamp)
     }
 
-    /// Gets a timestamp from a TSO.
-    pub fn get_timestamp(&self) -> Result<u64> {
-        // Your code here.
-        unimplemented!()
-    }
+    const RETRY_TIMES: usize = 3;
+    const BACKOFF_MILLIS: u64 = 50;
 
-    /// Begins a new transaction.
-    pub fn begin(&mut self) {
-        // Your code here.
-        unimplemented!()
-    }
+    async fn call<T>(rpc: impl Fn() -> RpcFuture<RpcResult<T>>) -> RpcResult<T> {
+        let mut reply = rpc().await;
+        for i in 0..Self::RETRY_TIMES {
+            if reply.is_ok() {
+                return reply;
+            }
 
-    /// Gets the value for a given key.
-    pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
-        // Your code here.
-        unimplemented!()
-    }
+            Delay::new(Duration::from_millis(Self::BACKOFF_MILLIS << i)).await;
+            reply = rpc().await;
+        }
 
-    /// Sets keys in a buffer until commit time.
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        // Your code here.
-        unimplemented!()
+        reply
     }
+}
 
-    /// Commits a transaction.
-    pub fn commit(&self) -> Result<bool> {
-        // Your code here.
-        unimplemented!()
+impl CommitArgs {
+    fn new(start_ts: u64, commit_ts: u64, key: Vec<u8>, is_primary: bool) -> Self {
+        Self {
+            start_ts,
+            commit_ts,
+
+            key,
+            is_primary,
+        }
     }
 }
