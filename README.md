@@ -1,3 +1,9 @@
+# DSS
+
+DSS is an implementation of [TP 202: Distributed Systems in Rust](https://github.com/pingcap/talent-plan/tree/master/courses/dss) for study purposes only.
+
+---
+
 # Distributed Systems in Rust
 
 A training course about the distributed systems in [Rust].
